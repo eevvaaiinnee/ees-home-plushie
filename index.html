@@ -992,20 +992,25 @@ async function deletePlushieRecord(record){
 }
 
 // Double-click picks whichever plushie is visually closest to the click.
-canvas.addEventListener('dblclick', (e) => {
-  if (orientingPlushie){ openNameEdit(orientingPlushie); return; }
-  if (!currentUser){ showToast('Sign in to edit'); return; }
-  if (plushies.size === 0) return;
+function pickPlushieNear(clientX, clientY, thresholdPx = 130){
+  if (plushies.size === 0) return null;
   const rect = stageEl.getBoundingClientRect();
-  const clickX = e.clientX - rect.left, clickY = e.clientY - rect.top;
+  const x = clientX - rect.left, y = clientY - rect.top;
   let best = null, bestDist = Infinity;
   plushies.forEach(p => {
     const s = worldToScreen(p.mesh.position.x, p.mesh.position.y + p.height * 0.5, p.mesh.position.z);
     if (!s.onScreen) return;
-    const d = Math.hypot(s.x - clickX, s.y - clickY);
+    const d = Math.hypot(s.x - x, s.y - y);
     if (d < bestDist){ bestDist = d; best = p; }
   });
-  if (best && bestDist < 160) enterOrientMode(best);
+  return (best && bestDist < thresholdPx) ? best : null;
+}
+
+canvas.addEventListener('dblclick', (e) => {
+  if (orientingPlushie){ openNameEdit(orientingPlushie); return; }
+  if (!currentUser){ showToast('Sign in to edit'); return; }
+  const best = pickPlushieNear(e.clientX, e.clientY, 160);
+  if (best) openNameEdit(best);
 });
 
 /* =========================================================
@@ -1179,21 +1184,13 @@ async function exitOrientMode(){
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-// Right-drag on an already-placed plushie (outside the orient step) moves it.
-// OrbitControls has panning disabled, so right-drag is otherwise unused here.
+// Right-drag on an already-placed plushie moves it. OrbitControls has
+// panning disabled, so right-drag is otherwise unused here.
 canvas.addEventListener('pointerdown', (downEvt) => {
-  if (orientingPlushie || downEvt.button !== 2 || plushies.size === 0) return;
+  if (orientingPlushie || downEvt.button !== 2) return;
   if (!currentUser){ showToast('Sign in to move a plushie'); return; }
-  const rect = stageEl.getBoundingClientRect();
-  const clickX = downEvt.clientX - rect.left, clickY = downEvt.clientY - rect.top;
-  let best = null, bestDist = Infinity;
-  plushies.forEach(p => {
-    const s = worldToScreen(p.mesh.position.x, p.mesh.position.y + p.height * 0.5, p.mesh.position.z);
-    if (!s.onScreen) return;
-    const d = Math.hypot(s.x - clickX, s.y - clickY);
-    if (d < bestDist){ bestDist = d; best = p; }
-  });
-  if (!best || bestDist > 160) return;
+  const best = pickPlushieNear(downEvt.clientX, downEvt.clientY, 160);
+  if (!best) return;
 
   const mesh = best.mesh;
   const startX = downEvt.clientX, startY = downEvt.clientY;
@@ -1219,6 +1216,64 @@ canvas.addEventListener('pointerdown', (downEvt) => {
   window.addEventListener('pointermove', onMove);
   window.addEventListener('pointerup', onUp);
 });
+
+// Left-drag on an already-placed plushie rotates just that one, exactly like
+// right-drag moves just one — no separate "mode" needed, saves immediately
+// on release. Registered on the CAPTURE phase so it's evaluated before
+// OrbitControls' own rotate handler; when a plushie is under the cursor we
+// disable OrbitControls for the duration of this one gesture so the camera
+// doesn't orbit at the same time.
+canvas.addEventListener('pointerdown', (downEvt) => {
+  if (orientingPlushie || downEvt.button !== 0 || !currentUser) return;
+  const picked = pickPlushieNear(downEvt.clientX, downEvt.clientY);
+  if (!picked) return; // nothing under the cursor — let OrbitControls orbit as usual
+
+  controls.enabled = false;
+  const mesh = picked.mesh;
+  const startX = downEvt.clientX, startY = downEvt.clientY;
+  const startRotY = mesh.rotation.y, startRotX = mesh.rotation.x;
+  canvas.style.cursor = 'grabbing';
+  function onMove(moveEvt){
+    const dx = moveEvt.clientX - startX, dy = moveEvt.clientY - startY;
+    mesh.rotation.y = startRotY - dx * 0.012;
+    mesh.rotation.x = startRotX + dy * 0.012;
+  }
+  function onUp(){
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    canvas.style.cursor = '';
+    controls.enabled = !!currentUser;
+    ensureSupabase()
+      .then(sb => sb.from('plushies').update({
+        rot_x: mesh.rotation.x, rot_y: mesh.rotation.y, rot_z: mesh.rotation.z
+      }).eq('id', picked.id))
+      .catch(err => console.error('[rotate plushie failed]', err));
+  }
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}, true);
+
+// Scrolling over an already-placed plushie resizes just that one; scrolling
+// anywhere else still zooms the shared camera as before. Debounced save so
+// a burst of scroll ticks doesn't spam the database.
+let resizeSaveTimer = null;
+canvas.addEventListener('wheel', (wheelEvt) => {
+  if (orientingPlushie || !currentUser) return;
+  const picked = pickPlushieNear(wheelEvt.clientX, wheelEvt.clientY, 100);
+  if (!picked) return; // let the camera zoom as usual
+
+  wheelEvt.preventDefault();
+  wheelEvt.stopPropagation();
+  const factor = wheelEvt.deltaY > 0 ? 0.94 : 1.06;
+  picked.mesh.scale.multiplyScalar(factor);
+
+  clearTimeout(resizeSaveTimer);
+  resizeSaveTimer = setTimeout(() => {
+    ensureSupabase()
+      .then(sb => sb.from('plushies').update({ scale: picked.mesh.scale.x }).eq('id', picked.id))
+      .catch(err => console.error('[resize plushie failed]', err));
+  }, 400);
+}, { capture: true, passive: false });
 
 canvas.addEventListener('pointerdown', (downEvt) => {
   if (!orientingPlushie) return;
